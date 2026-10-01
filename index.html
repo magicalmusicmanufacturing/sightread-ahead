@@ -67,8 +67,6 @@ button:disabled{opacity:.45;cursor:default}
 .bar{position:absolute;border-radius:3px}
 .cover{
   position:absolute;inset:0;border-radius:3px;background:var(--card);
-  background-image:linear-gradient(var(--card-rule),var(--card-rule));
-  background-size:100% 2px;background-repeat:no-repeat;background-position:0 14px;
   transform:scaleX(0);transform-origin:left center;transition:transform 110ms ease-out,opacity 150ms;
   box-shadow:0 3px 8px -3px rgba(0,0,0,.4);
 }
@@ -76,6 +74,8 @@ button:disabled{opacity:.45;cursor:default}
 .bar.on.peek .cover{opacity:0}
 .bar.on.peek{outline:2px dashed var(--peek);outline-offset:-1px}
 .bar.clickable{cursor:pointer}
+.bar.start{outline:3px solid var(--led);outline-offset:-2px}
+.startbar{display:flex;align-items:center;gap:8px;font-size:.9rem;color:var(--muted)}
 .bar .num{position:absolute;left:6px;bottom:4px;font-size:.75rem;color:#fff;opacity:0;transition:opacity 150ms}
 .bar.on:not(.peek) .num{opacity:.7}
 
@@ -152,7 +152,7 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
   <div class="paper">
     <div id="score"><div id="svgHost"></div><div id="overlay"></div></div>
   </div>
-  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in and restarts the bar you paused in. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise.</p>
+  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise.</p>
 </div>
 
 <div class="transport">
@@ -160,6 +160,7 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
     <button id="play" aria-label="Play"></button>
     <div class="beats" id="beats" aria-hidden="true"></div>
     <div class="readout" aria-live="polite"><div class="big" id="big">Ready</div><div class="small" id="small">Take a look, then press play</div></div>
+    <label class="startbar">Start at bar <select id="startBar"></select></label>
     <div class="spacer"></div>
     <div class="tbtns">
       <button id="listen">Listen</button>
@@ -227,28 +228,31 @@ function parseMeasures(str, key){
   return str.split('|').map(m => {
     const carry = {};   // accidentals written earlier in the same bar
     return m.trim().split(/\s+/).map(tok => {
-      const r = tok.match(/^r(w|h|q|8)(d?)$/);
-      if (r) return {rest:true, d:r[1]+r[2]};
-      const t = tok.match(/^([a-g])(#|b|n)?(\d)(w|h|q|8)(d?)(~?)$/);
+      const r = tok.match(/^([rx])(16|w|h|q|8)(d?)$/);
+      if (r) return r[1]==='r' ? {rest:true, d:r[2]+r[3]} : {ghost:true, d:r[2]+r[3]};
+      const t = tok.match(/^([a-g][#bn]?\d(?:\+[a-g][#bn]?\d)*)(16|w|h|q|8)(d?)(~?)$/);
       if (!t) throw new Error('Unreadable note: '+tok);
-      const [,l,acc,oct,d,dot,tie] = t;
-      if (acc) carry[l+oct] = acc;
-      const eff = carry[l+oct];
-      const pitchAcc = eff ? (eff==='n' ? '' : eff) : (KEYS[key].sig[l] || '');
-      return {key:l+pitchAcc+'/'+oct, d:d+dot, acc:acc||null, tie:!!tie};
+      const pitches = t[1].split('+').map(p => {
+        const [, l, acc, oct] = p.match(/^([a-g])([#bn]?)(\d)$/);
+        if (acc) carry[l+oct] = acc;
+        const eff = carry[l+oct];
+        const pa = eff ? (eff==='n' ? '' : eff) : (KEYS[key].sig[l] || '');
+        return {key:l+pa+'/'+oct, acc:acc||null};
+      }).sort((x,y) => midiOf(x.key) - midiOf(y.key));
+      return {keys:pitches.map(p=>p.key), accs:pitches.map(p=>p.acc), d:t[2]+t[3], tie:!!t[4]};
     });
   });
 }
 function fromLibrary(item){
-  const rh = parseMeasures(item.rh, item.key), lh = parseMeasures(item.lh || down8(item.rh), item.key);
-  if (rh.length !== lh.length) console.error('Bar count mismatch in No. '+item.no, rh.length, lh.length);
+  const P = str => parseMeasures(str, item.key);
+  const rh = [P(item.rh)].concat(item.rh2 ? [P(item.rh2)] : []);
+  const lh = [P(item.lh || down8(item.rh))].concat(item.lh2 ? [P(item.lh2)] : []);
+  const counts = rh.concat(lh).map(v => v.length);
+  if (new Set(counts).size > 1) console.error('Bar count mismatch in No. '+item.no, counts);
   return {
     key:item.key, meter:METERS[item.time],
-    title:'Christian Schäfer, Op. 45 No. '+item.no+': '+item.desc,
-    staves:[
-      {clef:'treble', measures:rh},
-      {clef:'bass', measures:lh}
-    ]
+    title:(item.source || 'Christian Schäfer, Op. 45') + ' No. '+item.no+': '+item.desc,
+    staves:[ {clef:'treble', voices:rh}, {clef:'bass', voices:lh} ]
   };
 }
 
@@ -299,8 +303,8 @@ function generate(opts){
   raw.push([{step:t,dur:4}]);
   const measures = raw.map(ms => ms.map(n => n.rest
     ? {rest:true, d:DUR[n.dur]}
-    : {key:stepToKey(n.step,key), d:DUR[n.dur]}));
-  return {key, meter:METERS['4/4'], title:'', staves:[{clef:opts.clef, measures}]};
+    : {keys:[stepToKey(n.step,key)], accs:[null], d:DUR[n.dur]}));
+  return {key, meter:METERS['4/4'], title:'', staves:[{clef:opts.clef, voices:[measures]}]};
 }
 
 /* ---------- state ---------- */
@@ -313,17 +317,19 @@ let ac = null, session = null, t0 = 0, spb = 1, raf = 0;
 const opts = () => ({
   bars: +$('bars').value, clef: $('clef').value, key: $('key').value, level: +$('level').value
 });
-const nBars = () => ex.staves[0].measures.length;
+const nBars = () => ex.staves[0].voices[0].length;
 
 /* ---------- rendering ---------- */
-function makeNotes(meas, clef){
-  const restKey = clef==='treble' ? 'b/4' : 'd/3';
+function makeNotes(meas, clef, dir){
+  const RK = {treble:{0:'b/4',1:'d/5','-1':'g/4'}, bass:{0:'d/3',1:'f/3','-1':'b/2'}};
+  const restKey = RK[clef][dir];
   return meas.map(nt => {
-    const sn = nt.rest
-      ? new VF.StaveNote({clef, keys:[restKey], duration:nt.d+'r'})
-      : new VF.StaveNote({clef, keys:[nt.key], duration:nt.d, auto_stem:true});
-    if (nt.d.endsWith('d')) VF.Dot.buildAndAttach([sn], {all:true});
-    if (nt.acc) sn.addModifier(new VF.Accidental(nt.acc), 0);
+    if (nt.ghost) return new VF.GhostNote({duration:nt.d});
+    const o = nt.rest ? {clef, keys:[restKey], duration:nt.d+'r'} : {clef, keys:nt.keys, duration:nt.d};
+    if (!nt.rest){ if (dir) o.stem_direction = dir; else o.auto_stem = true; }
+    const sn = new VF.StaveNote(o);
+    if (nt.d.length > 1 && nt.d.endsWith('d')) VF.Dot.buildAndAttach([sn], {all:true});
+    (nt.accs||[]).forEach((acc,k) => { if (acc) sn.addModifier(new VF.Accidental(acc), k); });
     return sn;
   });
 }
@@ -342,7 +348,7 @@ function render(){
   renderer.resize(W, lines*sysH + 16);
   const ctx = renderer.getContext();
   const accCount = Object.keys(KEYS[ex.key].sig).length;
-  const seqs = ex.staves.map(() => []);   // for ties: {sn, tie, line}
+  const seqs = ex.staves.map(sd => sd.voices.map(() => []));   // for ties
   const CT = VF.StaveConnector.type;
 
   for (let line=0; line<lines; line++){
@@ -369,16 +375,21 @@ function render(){
         conn(i===n-1 ? CT.BOLD_DOUBLE_RIGHT : CT.SINGLE_RIGHT);
       }
       const parts = ex.staves.map((sd,s) => {
-        const notes = makeNotes(sd.measures[i], sd.clef);
-        sd.measures[i].forEach((nt,k) => { if(!nt.rest) seqs[s].push({sn:notes[k], tie:nt.tie, line}); });
-        const beams = VF.Beam.generateBeams(notes, {groups:[new VF.Fraction(ex.meter.beam[0], ex.meter.beam[1])]});
-        const v = new VF.Voice({num_beats:ex.meter.num, beat_value:ex.meter.val}).setMode(VF.Voice.Mode.SOFT).addTickables(notes);
-        return {v, beams};
+        const dirs = sd.voices.length > 1 ? [1,-1] : [0];
+        return sd.voices.map((vm,vi) => {
+          const meas = vm[i];
+          const notes = makeNotes(meas, sd.clef, dirs[vi]);
+          meas.forEach((nt,k) => { if (!nt.rest && !nt.ghost) seqs[s][vi].push({sn:notes[k], nt, line}); });
+          const real = notes.filter(nn => !(nn instanceof VF.GhostNote));
+          const beams = VF.Beam.generateBeams(real, {groups:[new VF.Fraction(ex.meter.beam[0], ex.meter.beam[1])], maintain_stem_directions: dirs[vi] !== 0});
+          const v = new VF.Voice({num_beats:ex.meter.num, beat_value:ex.meter.val}).setMode(VF.Voice.Mode.SOFT).addTickables(notes);
+          return {v, beams};
+        });
       });
       const fmt = new VF.Formatter();
-      parts.forEach(p => fmt.joinVoices([p.v]));
-      fmt.format(parts.map(p=>p.v), Math.max(40, x + w - nsx - 14));
-      parts.forEach((p,s) => { p.v.draw(ctx, vs[s]); p.beams.forEach(b => b.setContext(ctx).draw()); });
+      parts.forEach(p => fmt.joinVoices(p.map(o => o.v)));
+      fmt.format(parts.flat().map(o => o.v), Math.max(40, x + w - nsx - 14));
+      parts.forEach((p,s) => p.forEach(o => { o.v.draw(ctx, vs[s]); o.beams.forEach(b => b.setContext(ctx).draw()); }));
 
       const x0 = j===0 ? nsx - 4 : x + 3;
       const yTop = vs[0].getYForLine(0) - 34;
@@ -396,31 +407,42 @@ function render(){
   }
 
   // ties, split across system breaks
-  seqs.forEach(seq => seq.forEach((a,k) => {
+  seqs.flat().forEach(seq => seq.forEach((a,k) => {
     const b = seq[k+1];
-    if (!a.tie || !b) return;
-    const tie = o => new VF.StaveTie(Object.assign({first_indices:[0], last_indices:[0]}, o)).setContext(ctx).draw();
+    if (!a.nt.tie || !b) return;
+    const fi = [], li = [];
+    a.nt.keys.forEach((key,ii) => { const jj = b.nt.keys.indexOf(key); if (jj >= 0){ fi.push(ii); li.push(jj); } });
+    if (!fi.length) return;
+    const tie = o => new VF.StaveTie(Object.assign({first_indices:fi, last_indices:li}, o)).setContext(ctx).draw();
     if (a.line===b.line) tie({first_note:a.sn, last_note:b.sn});
     else { tie({first_note:a.sn}); tie({last_note:b.sn}); }
   }));
   syncCovers();
 }
 
+const startBar = () => +$('startBar').value || 0;
+function fillStartBars(){
+  $('startBar').innerHTML = Array.from({length:nBars()}, (_,k) => '<option value="'+k+'">'+(k+1)+'</option>').join('');
+}
+function setStartBar(k){ $('startBar').value = String(k); syncCovers(); }
 function syncCovers(){
-  const canPeek = state==='paused' || state==='done';
+  const busy = state==='playing' || state==='listening';
+  const sb = startBar();
   document.querySelectorAll('.bar').forEach(el => {
     const i = +el.dataset.i;
     el.classList.toggle('on', !!covered[i]);
     el.classList.toggle('peek', !!peek[i]);
-    el.classList.toggle('clickable', canPeek && !!covered[i]);
-    el.title = canPeek && covered[i] ? (peek[i] ? 'Cover bar '+(i+1) : 'Peek at bar '+(i+1)) : '';
+    el.classList.toggle('clickable', !busy);
+    el.classList.toggle('start', !busy && i===sb && !covered[i]);
+    el.title = busy ? '' : covered[i] ? (peek[i] ? 'Cover bar '+(i+1) : 'Peek at bar '+(i+1)) : 'Start from bar '+(i+1);
   });
 }
 
 function onBarClick(i){
-  if (!(state==='paused' || state==='done') || !covered[i]) return;
-  peek[i] = !peek[i];
-  syncCovers();
+  if (state==='playing' || state==='listening') return;
+  if (covered[i]){ peek[i] = !peek[i]; syncCovers(); return; }
+  setStartBar(i);
+  readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(i+1)+'.');
 }
 
 /* ---------- audio ---------- */
@@ -455,20 +477,15 @@ function updateButtons(){
   $('play').innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   $('listen').textContent = state==='listening' ? 'Stop listening' : 'Listen';
   $('play').setAttribute('aria-label', playing ? 'Pause' : state==='paused' ? 'Resume' : 'Play');
-  ['src','bars','clef','key','level','tempo'].forEach(id => $(id).disabled = playing);
+  ['src','bars','clef','key','level','tempo','startBar'].forEach(id => $(id).disabled = playing);
 }
 
 const countIn = () => ex.meter.pulses >= 3 ? ex.meter.pulses : ex.meter.pulses*2;
 function play(){
   if (state==='listening') stopListen();
   ensureAudio();
-  if (state==='idle' || state==='done'){
-    startMeasure = 0;
-    covered = []; peek = [];
-  } else {
-    startMeasure = pausedMeasure;
-    peek = [];
-  }
+  startMeasure = startBar();
+  covered = []; peek = [];
   spb = 60 / +$('tempo').value;
   session = ac.createGain(); session.connect(ac.destination);
   t0 = ac.currentTime + 0.15;
@@ -504,7 +521,7 @@ function tick(){
     if (m >= n){ finish(); return; }
     if (m !== currentMeasure){
       currentMeasure = m;
-      for (let k=0;k<=m;k++) covered[k] = true;
+      for (let k=startMeasure;k<=m;k++) covered[k] = true;
       syncCovers();
       readout('Bar '+(m+1)+' of '+n, m+1<n ? 'Read bar '+(m+2)+' now' : 'Last bar, hold it out');
     }
@@ -519,7 +536,7 @@ function midiOf(k){
   return 12*(+o+1) + SEMI[l] + (a==='#' ? 1 : a==='b' ? -1 : 0);
 }
 function durQ(d){
-  const base = {w:4,h:2,q:1,'8':0.5}[d.replace(/d$/,'')];
+  const base = {w:4,h:2,q:1,'8':0.5,'16':0.25}[d.replace(/d$/,'')];
   return d.length>1 && d.endsWith('d') ? base*1.5 : base;
 }
 function tone(midi, t, len){
@@ -543,18 +560,22 @@ function listen(){
   session = ac.createGain(); session.connect(ac.destination);
   const tStart = ac.currentTime + 0.1;
   let totalQ = 0;
-  ex.staves.forEach(sd => {
-    let t = 0; const evs = []; let last = null;
-    sd.measures.flat().forEach(nt => {
+  ex.staves.forEach(sd => sd.voices.forEach(vm => {
+    let t = 0, open = {}; const evs = [];
+    vm.flat().forEach(nt => {
       const q = durQ(nt.d);
-      if (nt.rest){ last = null; t += q; return; }
-      if (last && last.tie && last.key===nt.key){ last.len += q; last.tie = nt.tie; }
-      else { last = {key:nt.key, start:t, len:q, tie:nt.tie}; evs.push(last); }
-      t += q;
+      if (nt.rest || nt.ghost){ open = {}; t += q; return; }
+      const next = {};
+      nt.keys.forEach(k => {
+        const prev = open[k];
+        if (prev && prev.tie){ prev.len += q; prev.tie = nt.tie; next[k] = prev; }
+        else { const e = {key:k, start:t, len:q, tie:nt.tie}; evs.push(e); next[k] = e; }
+      });
+      open = next; t += q;
     });
     evs.forEach(e => tone(midiOf(e.key), tStart + e.start*qSec, e.len*qSec));
     totalQ = Math.max(totalQ, t);
-  });
+  }));
   state = 'listening';
   updateButtons(); syncCovers();
   readout('Listening', 'Playback of all '+nBars()+' bars at the current tempo');
@@ -577,13 +598,15 @@ function pause(){
   stopAudio();
   pausedMeasure = currentMeasure >= 0 ? currentMeasure : startMeasure;
   state = 'paused';
+  $('startBar').value = String(pausedMeasure);
   updateButtons(); syncCovers();
-  readout('Paused', 'Click a covered bar to peek. Play resumes at bar '+(pausedMeasure+1)+'.');
+  readout('Paused', 'Click a covered bar to peek. Play resumes at bar '+(pausedMeasure+1)+', or click any uncovered bar to start there.');
 }
 
 function finish(){
   stopAudio();
   state = 'done';
+  $('startBar').value = '0';
   updateButtons(); syncCovers();
   readout('Done', 'Click bars to check yourself, or reveal all');
 }
@@ -592,6 +615,7 @@ function restart(){
   if (state==='listening'){ stopListen(); return; }
   stopAudio();
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
+  $('startBar').value = '0';
   updateButtons(); syncCovers();
   readout('Ready', 'Take a look, then press play');
 }
@@ -611,6 +635,7 @@ function loadExercise(){
   $('caption').hidden = !ex.title;
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
   buildLeds(); tempoLabel();
+  fillStartBars();
   render(); updateButtons();
   readout('Ready', ex.key+' major, '+ex.meter.sig.replace('C','4/4')+', '+nBars()+' bars. Take a look, then press play.');
 }
@@ -639,6 +664,7 @@ $('newBtn').addEventListener('click', newExercise);
 $('src').addEventListener('change', () => { syncSourceUI(); loadExercise(); });
 $('tempo').addEventListener('input', tempoLabel);
 $('listen').addEventListener('click', listen);
+$('startBar').addEventListener('change', () => { syncCovers(); readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(startBar()+1)+'.'); });
 
 document.addEventListener('keydown', e => {
   if (e.target.matches('input,select,textarea') && e.key!==' ') return;
