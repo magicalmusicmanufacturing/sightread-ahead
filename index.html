@@ -80,6 +80,7 @@ button:disabled{opacity:.45;cursor:default}
 .bar.on:not(.peek) .num{opacity:.7}
 
 .caption{margin:0 0 8px;font-weight:700}
+.credit{color:var(--muted);font-size:.85rem;margin-top:10px}
 .hint{color:var(--muted);font-size:.9rem;margin-top:14px;max-width:70ch}
 kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--surface)}
 
@@ -145,6 +146,9 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
     </label>
     </span>
     <label class="field check"><input id="clickOn" type="checkbox" checked> Metronome while playing</label>
+    <label class="field">Transpose
+      <select id="transpose"></select>
+    </label>
     <button id="newBtn">New exercise</button>
   </div>
 
@@ -153,6 +157,7 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
     <div id="score"><div id="svgHost"></div><div id="overlay"></div></div>
   </div>
   <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise.</p>
+  <p class="credit">Copyright © 2026 Alexander Zhu</p>
 </div>
 
 <div class="transport">
@@ -191,7 +196,13 @@ const KEYS = {
   G:{idx:4,sig:{f:'#'}},
   D:{idx:1,sig:{f:'#',c:'#'}},
   A:{idx:5,sig:{f:'#',c:'#',g:'#'}},
+  E:{idx:2,sig:{f:'#',c:'#',g:'#',d:'#'}},
+  B:{idx:6,sig:{c:'#',d:'#',f:'#',g:'#',a:'#'}},
   F:{idx:3,sig:{b:'b'}},
+  'F#':{idx:3,sig:{f:'#',c:'#',g:'#',d:'#',a:'#',e:'#'}},
+  Db:{idx:1,sig:{b:'b',e:'b',a:'b',d:'b',g:'b'}},
+  Eb:{idx:2,sig:{b:'b',e:'b',a:'b'}},
+  Ab:{idx:5,sig:{b:'b',e:'b',a:'b',d:'b'}},
   Bb:{idx:6,sig:{b:'b',e:'b'}}
 };
 const RANDOM_KEYS = ['C','G','D','F','Bb'];
@@ -252,7 +263,8 @@ function fromLibrary(item){
   return {
     key:item.key, meter:METERS[item.time],
     title:(item.source || 'Christian Schäfer, Op. 45') + ' No. '+item.no+': '+item.desc,
-    staves:[ {clef:'treble', voices:rh}, {clef:'bass', voices:lh} ]
+    keyName: item.keyName || null,
+    staves:[ {clef:item.rhClef || 'treble', voices:rh}, {clef:item.lhClef || 'bass', voices:lh} ]
   };
 }
 
@@ -308,7 +320,7 @@ function generate(opts){
 }
 
 /* ---------- state ---------- */
-let ex = null;
+let ex = null, baseEx = null;
 let covered = [], peek = [];
 let state = 'idle';              // idle | playing | paused | done
 let startMeasure = 0, currentMeasure = -1, pausedMeasure = 0;
@@ -320,6 +332,58 @@ const opts = () => ({
 const nBars = () => ex.staves[0].voices[0].length;
 
 /* ---------- rendering ---------- */
+/* ---------- transposition ---------- */
+const PC_NAME = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
+const KEY_PC = {C:0,Db:1,D:2,Eb:3,E:4,F:5,'F#':6,G:7,Ab:8,A:9,Bb:10,B:11};
+const ACC_OF = {'-2':'bb','-1':'b','0':'','1':'#','2':'##'};
+function transposeKeyName(key, s){ return PC_NAME[(KEY_PC[key] + s + 120) % 12]; }
+function transposeEx(base, s){
+  if (!s) return base;
+  const toKey = transposeKeyName(base.key, s);
+  const li = k => LETTERS.indexOf(k.toLowerCase()[0]);
+  let d = (li(toKey) - li(base.key) + 7) % 7;
+  if (s < 0) d = d ? d - 7 : 0;
+  if (s > 0 && d === 0) d = 7;
+  const sig = KEYS[toKey].sig;
+  const tKey = k => {
+    const m = midiOf(k) + s;
+    const [, l, , o] = k.match(/^([a-g])(##|bb|#|b)?\/(\d)$/);
+    const base0 = LETTERS.indexOf(l) + d;
+    for (const step of [base0, base0 + 1, base0 - 1]){   // respell if it would need a triple accidental
+      const nl = LETTERS[((step % 7) + 7) % 7], no = +o + Math.floor(step / 7);
+      const acc = ACC_OF[m - (12*(no+1) + SEMI[nl])];
+      if (acc !== undefined) return nl + acc + '/' + no;
+    }
+    return k;
+  };
+  const staves = base.staves.map(st => ({clef:st.clef, voices:st.voices.map(vm => vm.map(meas => {
+    const state = {};
+    return meas.map(nt => {
+      if (nt.rest || nt.ghost) return nt;
+      const keys = nt.keys.map(tKey);
+      const accs = keys.map(k => {
+        const [, l, a, o] = k.match(/^([a-g])(##|bb|#|b)?\/(\d)$/);
+        const cur = (l+o) in state ? state[l+o] : (sig[l] || '');
+        const want = a || '';
+        state[l+o] = want;
+        return want === cur ? null : (want || 'n');
+      });
+      return Object.assign({}, nt, {keys, accs});
+    });
+  }))}));
+  return Object.assign({}, base, {key:toKey, staves, transposed:s});
+}
+function fillTranspose(){
+  const sel = $('transpose'), cur = +sel.value || 0;
+  sel.innerHTML = '';
+  for (let s = -6; s <= 6; s++){
+    const o = document.createElement('option');
+    o.value = s; o.textContent = s === 0 ? 'Original ('+baseEx.key+')' : (s > 0 ? '+' : '−') + Math.abs(s) + ' to ' + transposeKeyName(baseEx.key, s);
+    sel.appendChild(o);
+  }
+  sel.value = String(cur);
+}
+
 function makeNotes(meas, clef, dir){
   const RK = {treble:{0:'b/4',1:'d/5','-1':'g/4'}, bass:{0:'d/3',1:'f/3','-1':'b/2'}};
   const restKey = RK[clef][dir];
@@ -477,7 +541,7 @@ function updateButtons(){
   $('play').innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   $('listen').textContent = state==='listening' ? 'Stop listening' : 'Listen';
   $('play').setAttribute('aria-label', playing ? 'Pause' : state==='paused' ? 'Resume' : 'Play');
-  ['src','bars','clef','key','level','tempo','startBar'].forEach(id => $(id).disabled = playing);
+  ['src','bars','clef','key','level','tempo','startBar','transpose'].forEach(id => $(id).disabled = playing);
 }
 
 const countIn = () => ex.meter.pulses >= 3 ? ex.meter.pulses : ex.meter.pulses*2;
@@ -532,8 +596,8 @@ function tick(){
 
 const SEMI = {c:0,d:2,e:4,f:5,g:7,a:9,b:11};
 function midiOf(k){
-  const [, l, a, o] = k.match(/^([a-g])([#b]?)\/(\d)$/);
-  return 12*(+o+1) + SEMI[l] + (a==='#' ? 1 : a==='b' ? -1 : 0);
+  const [, l, a, o] = k.match(/^([a-g])(##|bb|#|b)?\/(\d)$/);
+  return 12*(+o+1) + SEMI[l] + ({'#':1,'##':2,'b':-1,'bb':-2}[a] || 0);
 }
 function durQ(d){
   const base = {w:4,h:2,q:1,'8':0.5,'16':0.25}[d.replace(/d$/,'')];
@@ -629,15 +693,28 @@ function syncSourceUI(){
 function loadExercise(){
   if (state==='listening') stopListen();
   stopAudio();
-  if (isLibrary()) ex = fromLibrary(LIBRARY[+$('src').value]);
-  else ex = generate(opts());
+  baseEx = isLibrary() ? fromLibrary(LIBRARY[+$('src').value]) : generate(opts());
+  fillTranspose();
+  ex = transposeEx(baseEx, +$('transpose').value);
   $('caption').textContent = ex.title;
   $('caption').hidden = !ex.title;
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
   buildLeds(); tempoLabel();
   fillStartBars();
   render(); updateButtons();
-  readout('Ready', ex.key+' major, '+ex.meter.sig.replace('C','4/4')+', '+nBars()+' bars. Take a look, then press play.');
+  readout('Ready', keyLabel()+', '+ex.meter.sig.replace('C','4/4')+', '+nBars()+' bars. Take a look, then press play.');
+}
+function keyLabel(){
+  if (ex.transposed) return 'Transposed to '+ex.key+' ('+(ex.transposed>0?'+':'−')+Math.abs(ex.transposed)+')';
+  return ex.keyName || (ex.key+' major');
+}
+function applyTranspose(){
+  if (state==='listening') stopListen();
+  stopAudio();
+  ex = transposeEx(baseEx, +$('transpose').value);
+  state = 'idle'; covered = []; peek = []; currentMeasure = -1;
+  render(); updateButtons();
+  readout('Ready', keyLabel()+'. Take a look, then press play.');
 }
 function newExercise(){
   if (isLibrary()){
@@ -661,7 +738,8 @@ $('restart').addEventListener('click', restart);
 $('reveal').addEventListener('click', revealAll);
 $('newBtn').addEventListener('click', newExercise);
 ['bars','clef','key','level'].forEach(id => $(id).addEventListener('change', loadExercise));
-$('src').addEventListener('change', () => { syncSourceUI(); loadExercise(); });
+$('src').addEventListener('change', () => { syncSourceUI(); $('transpose').value = '0'; loadExercise(); });
+$('transpose').addEventListener('change', applyTranspose);
 $('tempo').addEventListener('input', tempoLabel);
 $('listen').addEventListener('click', listen);
 $('startBar').addEventListener('change', () => { syncCovers(); readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(startBar()+1)+'.'); });
@@ -688,11 +766,17 @@ async function loadLibrary(){
     const inline = document.getElementById('inline-exercises');
     if (inline && inline.textContent.trim()) data = JSON.parse(inline.textContent);
   }
-  LIBRARY = (data && data.exercises ? data.exercises : []).slice().sort((x,y) => x.no - y.no);
+  const raw = (data && data.exercises ? data.exercises : []);
+  const setOf = it => it.set || 'Schäfer (Classical)';
+  const order = [...new Set(raw.map(setOf))];
+  LIBRARY = raw.slice().sort((x,y) => order.indexOf(setOf(x)) - order.indexOf(setOf(y)) || x.no - y.no);
+  const groups = {};
   LIBRARY.forEach((it,i) => {
+    const name = setOf(it);
+    if (!groups[name]){ groups[name] = document.createElement('optgroup'); groups[name].label = name; $('src').appendChild(groups[name]); }
     const o = document.createElement('option');
-    o.value = i; o.textContent = 'Schäfer Op. 45, No. '+it.no;
-    $('src').appendChild(o);
+    o.value = i; o.textContent = name+', No. '+it.no;
+    groups[name].appendChild(o);
   });
   if (!LIBRARY.length) readout('Ready', 'Exercise file not found, so only random exercises are available.');
 }
