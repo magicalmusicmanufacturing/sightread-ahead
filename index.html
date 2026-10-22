@@ -104,6 +104,11 @@ button:disabled{opacity:.45;cursor:default}
 .meter{width:120px;height:8px;border-radius:4px;background:var(--led-off);overflow:hidden}
 .meter span{display:block;height:100%;width:0;background:#3E9B62;transition:width 80ms}
 .recstatus{font-size:.9rem;color:var(--text);padding-bottom:7px;max-width:52ch}
+.meter.mini{width:44px;height:6px;flex:none}
+.checking{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.pbar{display:inline-block;width:180px;height:8px;border-radius:4px;background:var(--led-off);overflow:hidden}
+.pbar span{display:block;height:100%;width:0;background:var(--card);transition:width 200ms}
+.results .note{font-size:.88rem;color:var(--muted);margin-top:6px}
 kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--surface)}
 
 .transport{
@@ -176,6 +181,8 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
       <button id="midiBtn">Connect MIDI keyboard</button>
       <span class="midistatus" id="midiStatus" hidden><span class="mdot" id="mdot"></span><span id="midiText"></span></span>
       <label class="field check" id="midiSoundWrap" hidden><input id="midiSound" type="checkbox"> Sound from the app</label>
+      <button id="micBtn">Use microphone</button>
+      <span class="midistatus" id="micStatus" hidden><span class="meter mini" id="micMeter" hidden><span id="micLevel"></span></span><span id="micText"></span></span>
     </div>
   </div>
 
@@ -198,7 +205,7 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
     <div id="score"><div id="svgHost"></div><div id="overlay"></div></div>
   </div>
   <div class="results" id="results" aria-live="polite" hidden></div>
-  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise. With a MIDI keyboard connected, your notes are checked as you play: at the end, green notes were right and red ones were missed or wrong.</p>
+  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise. With a MIDI keyboard or the microphone on, your notes are checked: at the end, green notes were right and red ones were missed or wrong.</p>
   <p class="credit">Copyright © 2026 Alexander Zhu</p>
 </div>
 
@@ -430,12 +437,14 @@ function fillTranspose(){
   sel.value = String(cur);
 }
 
+// VexFlow's beam grouping misreads letter durations (q, h, w), so hand it numbers.
+const vfDur = d => d.replace(/^w/, '1').replace(/^h/, '2').replace(/^q/, '4');
 function makeNotes(meas, clef, dir){
   const RK = {treble:{0:'b/4',1:'d/5','-1':'g/4'}, bass:{0:'d/3',1:'f/3','-1':'b/2'}};
   const restKey = RK[clef][dir];
   return meas.map(nt => {
-    if (nt.ghost) return new VF.GhostNote({duration:nt.d});
-    const o = nt.rest ? {clef, keys:[restKey], duration:nt.d+'r'} : {clef, keys:nt.keys, duration:nt.d};
+    if (nt.ghost) return new VF.GhostNote({duration:vfDur(nt.d)});
+    const o = nt.rest ? {clef, keys:[restKey], duration:vfDur(nt.d)+'r'} : {clef, keys:nt.keys, duration:vfDur(nt.d)};
     if (!nt.rest){ if (dir) o.stem_direction = dir; else o.auto_stem = true; }
     const sn = new VF.StaveNote(o);
     if (nt.d.length > 1 && nt.d.endsWith('d')) VF.Dot.buildAndAttach([sn], {all:true});
@@ -447,7 +456,8 @@ function makeNotes(meas, clef, dir){
 }
 
 function render(){
-  const host = $('svgHost'), overlay = $('overlay');
+  const host = $('svgHost'), overlay = $('overlay'), scoreEl = $('score');
+  scoreEl.style.minHeight = scoreEl.offsetHeight + 'px';
   host.innerHTML = ''; overlay.innerHTML = '';
   const W = Math.max(300, $('score').clientWidth);
   const n = nBars();
@@ -512,6 +522,7 @@ function render(){
       el.style.width = (x + w - 3 - x0)+'px'; el.style.height = (yBot-yTop)+'px';
       el.innerHTML = '<div class="cover"></div><span class="num">'+(i+1)+'</span>' + badgeHtml(i);
       el.dataset.i = i;
+      el.dataset.line = line;
       el.addEventListener('click', () => onBarClick(i));
       overlay.appendChild(el);
       x += w;
@@ -529,7 +540,21 @@ function render(){
     if (a.line===b.line) tie({first_note:a.sn, last_note:b.sn});
     else { tie({first_note:a.sn}); tie({last_note:b.sn}); }
   }));
+  scoreEl.style.minHeight = '';
   syncCovers();
+}
+
+/* Keep the line being played and the line after it on screen, scrolling only when needed. */
+function keepInView(i){
+  const el = document.querySelector('.bar[data-i="'+i+'"]');
+  if (!el) return;
+  const next = document.querySelector('.bar[data-line="'+(+el.dataset.line + 1)+'"]') || el;
+  const margin = 12;
+  const bottomEdge = window.innerHeight - document.querySelector('.transport').offsetHeight - margin;
+  const top = el.getBoundingClientRect().top, bottom = next.getBoundingClientRect().bottom;
+  if (top >= margin && bottom <= bottomEdge) return;
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({top: window.scrollY + top - margin, behavior: reduce ? 'auto' : 'smooth'});
 }
 
 const startBar = () => +$('startBar').value || 0;
@@ -589,7 +614,7 @@ function updateButtons(){
   $('play').innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   $('listen').textContent = state==='listening' ? 'Stop listening' : 'Listen';
   $('play').setAttribute('aria-label', playing ? 'Pause' : state==='paused' ? 'Resume' : 'Play');
-  ['src','bars','clef','key','level','tempo','startBar','transpose','recOn'].forEach(id => $(id).disabled = playing);
+  ['src','bars','clef','key','level','tempo','startBar','transpose','recOn','micBtn','midiBtn'].forEach(id => $(id).disabled = playing);
 }
 
 const countIn = () => ex.meter.pulses >= 3 ? ex.meter.pulses : ex.meter.pulses*2;
@@ -618,10 +643,12 @@ function play(){
   tolSec = Math.min(0.35, Math.max(0.15, 0.3 * spb));
   expected = expectedNotes();
   played = [];
-  clearResults();
+  const hadResults = clearResults();
   state = 'playing';
   startTake();
-  render(); updateButtons();
+  if (hadResults) render(); else syncCovers();
+  updateButtons();
+  keepInView(startMeasure);
   raf = requestAnimationFrame(tick);
 }
 
@@ -648,6 +675,7 @@ function tick(){
       currentMeasure = m;
       for (let k=startMeasure;k<=m;k++) covered[k] = true;
       syncCovers();
+      keepInView(m);
       readout('Bar '+(m+1)+' of '+n, m+1<n ? 'Read bar '+(m+2)+' now' : 'Last bar, hold it out');
     }
     setLeds(pb % P);
@@ -735,10 +763,11 @@ function finish(){
   state = 'done';
   $('startBar').value = '0';
   const scored = scoreRun(Infinity, true);
-  endTake(false);
+  const checking = endTake(false);
   if (scored){ covered = []; peek = []; render(); }
   updateButtons(); syncCovers();
-  readout('Done', scored ? 'Your results are below the score.' : 'Click bars to check yourself, or reveal all');
+  readout('Done', scored ? 'Your results are below the score.' : checking ? 'Checking your playing\u2026' : 'Click bars to check yourself, or reveal all');
+  if (scored) revealResults();
 }
 
 function restart(){
@@ -781,6 +810,7 @@ function expectedNotes(){
 }
 
 function clearResults(){
+  micRun++;                                         // drop any microphone check still running
   const had = marks.size > 0 || barStats.length > 0;
   marks = new Map(); barStats = [];
   $('results').hidden = true; $('results').innerHTML = '';
@@ -797,22 +827,29 @@ function badgeHtml(i){
 }
 
 // Match what was played against what was written. upTo = how far into the run to judge (seconds).
-function scoreRun(upTo, final){
-  if (!midiInputs) return false;
+// heardNotes: notes from the microphone ({midi, t}); otherwise the MIDI keyboard's notes are used.
+// The microphone also hears overtones, so it judges only whether each written note was heard on time.
+function scoreRun(upTo, final, heardNotes, timingEstimated){
+  const fromMic = Array.isArray(heardNotes);
+  const notes = fromMic ? heardNotes : played;
+  if (!fromMic && !midiInputs) return false;
   const due = expected.filter(e => e.t <= upTo);
   if (!due.length) return false;
-  if (!played.length){
+  if (!notes.length){
+    if (!fromMic && micCheck) return false;          // the microphone check will report instead
     $('results').hidden = false;
-    $('results').innerHTML = 'No notes came in from your keyboard during that run. Check that it’s connected, then try again.';
+    $('results').innerHTML = fromMic
+      ? 'The microphone didn\u2019t pick up any notes during that run. Move the device closer to the piano or check your sound settings, then try again.'
+      : 'No notes came in from your keyboard during that run. Check that it\u2019s connected, then try again.';
     return false;
   }
-  const used = new Array(played.length).fill(false);
+  const used = new Array(notes.length).fill(false);
   let hits = 0, sumDt = 0;
   marks = new Map(); barStats = [];
   const stat = i => barStats[i] || (barStats[i] = {miss:0, extra:0});
   due.forEach(e => {
     let best = -1, bestDt = Infinity;
-    played.forEach((p, j) => {
+    notes.forEach((p, j) => {
       if (used[j] || p.midi !== e.midi) return;
       const dt = p.t - e.t;
       if (Math.abs(dt) <= tolSec && Math.abs(dt) < Math.abs(bestDt)){ best = j; bestDt = dt; }
@@ -824,7 +861,7 @@ function scoreRun(upTo, final){
   });
   // keys pressed that matched nothing (ignore the count-in)
   let extras = 0;
-  played.forEach((p, j) => {
+  if (!fromMic) played.forEach((p, j) => {
     if (used[j] || p.t < runOff - tolSec || p.t > Math.min(upTo, runEnd()) + tolSec) return;
     extras++;
     const bar = Math.min(nBars()-1, Math.max(startMeasure, startMeasure + Math.floor((p.t - runOff) / barSec())));
@@ -835,11 +872,17 @@ function scoreRun(upTo, final){
   const timing = !hits ? '' : Math.abs(avg) < 25 ? 'Your timing was right on the beat.'
     : 'On average you played '+Math.abs(avg)+' ms '+(avg > 0 ? 'late' : 'early')+'.';
   $('results').hidden = false;
-  $('results').innerHTML =
-    '<strong>'+hits+' of '+due.length+' notes right</strong>' + (final ? '' : ' so far') + '. ' +
-    (missed ? missed+' missed or wrong. ' : '') + (extras ? extras+' extra '+(extras===1?'key':'keys')+'. ' : '') + timing +
-    '<div class="legend"><span><span class="sw" style="background:'+COL_HIT+'"></span>Right note, on time</span>' +
-    '<span><span class="sw" style="background:'+COL_MISS+'"></span>Missed, wrong, or off the beat</span></div>';
+  $('results').innerHTML = fromMic
+    ? '<strong>'+hits+' of '+due.length+' notes heard on time</strong>' + (final ? '' : ' so far') + '. ' +
+      (missed ? missed+' missed, wrong, or off the beat. ' : '') + timing +
+      '<div class="legend"><span><span class="sw" style="background:'+COL_HIT+'"></span>Heard on time</span>' +
+      '<span><span class="sw" style="background:'+COL_MISS+'"></span>Not heard, wrong, or off the beat</span></div>' +
+      '<div class="note">Checked by microphone (beta), which doesn\u2019t count extra keys.' +
+      (timingEstimated ? ' The microphone couldn\u2019t hear the metronome, so timing is estimated; play with the metronome on your speakers for the best check.' : '') + '</div>'
+    : '<strong>'+hits+' of '+due.length+' notes right</strong>' + (final ? '' : ' so far') + '. ' +
+      (missed ? missed+' missed or wrong. ' : '') + (extras ? extras+' extra '+(extras===1?'key':'keys')+'. ' : '') + timing +
+      '<div class="legend"><span><span class="sw" style="background:'+COL_HIT+'"></span>Right note, on time</span>' +
+      '<span><span class="sw" style="background:'+COL_MISS+'"></span>Missed, wrong, or off the beat</span></div>';
   if (!final) render();
   return true;
 }
@@ -914,73 +957,288 @@ function release(n){
   delete sounding[n];
 }
 
-/* ---------- recording test: shown only when the address ends in ?record ----------
-   Saves a stereo WAV per run: channel 1 = microphone, channel 2 = the app's own metronome
-   clicks (a sample-accurate timing reference), plus a JSON chunk "rdah" describing the run. */
+/* Piano note transcription in the browser. Ported from @spotify/basic-pitch 1.0.1
+   (Copyright 2022 Spotify AB, Apache License 2.0, https://github.com/spotify/basic-pitch-ts).
+   Needs TensorFlow.js loaded as the global `tf`. Input: mono Float32Array at 22050 Hz. */
+const BasicPitch = (() => {
+  const SR = 22050, HOP = 256, FPS = Math.floor(SR / HOP), WIN_S = 2;
+  const N_SAMPLES = SR * WIN_S - HOP;
+  const N_OVERLAP = 30, HALF_OVERLAP = N_OVERLAP / 2, OVERLAP_SAMPLES = N_OVERLAP * HOP;
+  const HOP_SIZE = N_SAMPLES - OVERLAP_SAMPLES;
+  const ANNOT_N_FRAMES = FPS * WIN_S;
+  const WINDOW_OFFSET = (HOP / SR) * (ANNOT_N_FRAMES - N_SAMPLES / HOP) + 0.0018;
+  const MIDI_OFFSET = 21, MAX_FREQ_IDX = 87;
+  let modelP = null;
+
+  const load = url => modelP || (modelP = tf.loadGraphModel(url).catch(e => { modelP = null; throw e; }));
+
+  async function infer(audio, onProgress){
+    const model = await modelP;
+    const framed = tf.tidy(() => {
+      const wav = tf.concat1d([tf.zeros([OVERLAP_SAMPLES / 2], 'float32'), tf.tensor1d(audio)]);
+      return tf.expandDims(tf.signal.frame(wav, N_SAMPLES, HOP_SIZE, true, 0), -1);
+    });
+    const nOut = Math.floor(audio.length * (FPS / SR));
+    const frames = [], onsets = [];
+    for (let i = 0; i < framed.shape[0] && frames.length < nOut; i++){
+      if (onProgress) onProgress(i / framed.shape[0]);
+      const [f, o] = tf.tidy(() => {
+        const out = model.execute(tf.slice(framed, i, 1), ['Identity_1', 'Identity_2']);   // frames, onsets
+        const unwrap = r => {
+          const s = r.slice([0, HALF_OVERLAP, 0], [-1, r.shape[1] - 2 * HALF_OVERLAP, -1]);
+          return s.reshape([s.shape[0] * s.shape[1], s.shape[2]]);
+        };
+        const uf = unwrap(out[0]), uo = unwrap(out[1]);
+        const take = Math.min(uf.shape[0], nOut - frames.length);
+        return [uf.slice([0, 0], [take, -1]), uo.slice([0, 0], [take, -1])];
+      });
+      const fa = await f.array(), oa = await o.array();
+      f.dispose(); o.dispose();
+      for (const r of fa) frames.push(r);
+      for (const r of oa) onsets.push(r);
+      await new Promise(r => setTimeout(r, 0));          // let the page breathe between slices
+    }
+    framed.dispose();
+    if (onProgress) onProgress(1);
+    return {frames, onsets};
+  }
+
+  const argMax = a => a.reduce((mi, v, i) => a[mi] > v ? mi : i, -1);
+  const globalMax = m => m.reduce((p, row) => Math.max(p, ...row), 0);
+  function inferredOnsets(onsets, frames, nDiff = 2){
+    const W = frames[0].length, zero = new Array(W).fill(0);
+    const diffs = [];
+    for (let n = 1; n <= nDiff; n++){
+      const app = Array(n).fill(zero).concat(frames);
+      const plus = app.slice(n), minus = app.slice(0, -n);
+      diffs.push(plus.map((row, r) => row.map((v, c) => v - minus[r][c])));
+    }
+    let fd = diffs[0].map((row, r) => row.map((v, c) => Math.max(0, Math.min(v, ...diffs.slice(1).map(d => d[r][c])))));
+    fd = fd.map((row, r) => r < nDiff ? row.fill(0) : row);
+    const oMax = globalMax(onsets), fMax = globalMax(fd) || 1;
+    return onsets.map((row, r) => row.map((v, c) => Math.max(v, oMax * fd[r][c] / fMax)));
+  }
+  function notesFromOutput(frames, onsets, onsetThresh = 0.5, frameThresh = 0.3, minNoteLen = 11, energyTol = 11){
+    const nFrames = frames.length;
+    if (!nFrames) return [];
+    const io = inferredOnsets(onsets, frames);
+    const starts = [];                                    // relative maxima along time, above threshold
+    for (let c = 0; c < io[0].length; c++)
+      for (let r = 0; r < nFrames; r++){
+        const v = io[r][c];
+        if (v > onsetThresh && (r === 0 || v > io[r-1][c]) && (r === nFrames - 1 || v > io[r+1][c])) starts.push([r, c]);
+      }
+    starts.sort((a, b) => b[0] - a[0] || b[1] - a[1]);    // same order as the original (reversed row-major)
+    const energy = frames.map(f => f.slice());
+    const notes = [];
+    const clearAround = (j, f) => { energy[j][f] = 0; if (f < MAX_FREQ_IDX) energy[j][f+1] = 0; if (f > 0) energy[j][f-1] = 0; };
+    for (const [s, f] of starts){
+      if (s >= nFrames - 1) continue;
+      let i = s + 1, k = 0;
+      while (i < nFrames - 1 && k < energyTol){ k = energy[i][f] < frameThresh ? k + 1 : 0; i++; }
+      i -= k;
+      if (i - s <= minNoteLen) continue;
+      for (let j = s; j < i; j++) clearAround(j, f);
+      let amp = 0; for (let j = s; j < i; j++) amp += frames[j][f];
+      notes.push({startFrame:s, durationFrames:i - s, pitchMidi:f + MIDI_OFFSET, amplitude:amp / (i - s)});
+    }
+    // "melodia trick": pick up sustained notes whose onsets were missed
+    while (globalMax(energy) > frameThresh){
+      let iMid = 0, f = 0;
+      energy.forEach((row, r) => { const c = argMax(row); if (row[c] > energy[iMid][f]){ iMid = r; f = c; } });
+      energy[iMid][f] = 0;
+      let i = iMid + 1, k = 0;
+      while (i < nFrames - 1 && k < energyTol){ k = energy[i][f] < frameThresh ? k + 1 : 0; clearAround(i, f); i++; }
+      const iEnd = i - 1 - k;
+      i = iMid - 1; k = 0;
+      while (i > 0 && k < energyTol){ k = energy[i][f] < frameThresh ? k + 1 : 0; clearAround(i, f); i--; }
+      const iStart = i + 1 + k;
+      if (iEnd - iStart <= minNoteLen) continue;
+      let amp = 0; for (let j = iStart; j < iEnd; j++) amp += frames[j][f];
+      notes.push({startFrame:iStart, durationFrames:iEnd - iStart, pitchMidi:f + MIDI_OFFSET, amplitude:amp / (iEnd - iStart)});
+    }
+    const toTime = fr => fr * HOP / SR - WINDOW_OFFSET * Math.floor(fr / ANNOT_N_FRAMES);
+    return notes.map(n => ({midi:n.pitchMidi, start:toTime(n.startFrame), end:toTime(n.startFrame + n.durationFrames), amp:n.amplitude}));
+  }
+
+  async function transcribe(audio22k, onProgress){
+    const {frames, onsets} = await infer(audio22k, onProgress);
+    return notesFromOutput(frames, onsets);
+  }
+  return {SR, load, transcribe};
+})();
+
+/* Measure how long the app's metronome clicks take to come back through the microphone.
+   mic, clk: Float32Arrays from the same recording (clk = the app's own clicks, recorded digitally).
+   Returns {delay: seconds, confidence} or null when the clicks can't be heard (e.g. headphones). */
+function measureMicDelay(mic, clk, sr, firstClick, countInSec){
+  // Only the count-in is used: the student isn't playing yet, so anything sharp the mic hears is a click.
+  // 1. high-pass the mic (2nd-order Butterworth, 1 kHz) so piano body and room rumble drop out
+  const w0 = 2 * Math.PI * 1000 / sr, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2;
+  const b0 = (1 + cs) / 2 / (1 + al), b1 = -(1 + cs) / (1 + al), a1 = -2 * cs / (1 + al), a2 = (1 - al) / (1 + al);
+  const from = Math.max(0, firstClick - Math.round(0.02 * sr));
+  const maxLag = 350;
+  const clickEnd = firstClick + Math.round(countInSec * sr);
+  const to = Math.min(mic.length, clickEnd + Math.round(maxLag / 1000 * sr));
+  const bin = Math.max(1, Math.round(sr / 1000));                 // 1 ms envelope bins
+  const nb = Math.floor((to - from) / bin);
+  const me = new Float32Array(nb), ce = new Float32Array(nb);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = from, k = 0; k < nb; k++){
+    let sm = 0, sc = 0;
+    for (let j = 0; j < bin; j++, i++){
+      const x = mic[i], y = b0 * x + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = x; y2 = y1; y1 = y;
+      sm += y * y; if (i < clickEnd) sc += clk[i] * clk[i];
+    }
+    me[k] = Math.sqrt(sm / bin); ce[k] = Math.sqrt(sc / bin);
+  }
+  // 2. keep only sudden rises in the mic envelope (click attacks), not sustained sound
+  const md = new Float32Array(nb);
+  for (let k = 3; k < nb; k++) md[k] = Math.max(0, me[k] - Math.max(me[k-1], me[k-2], me[k-3]));
+  // 3. correlate against the click envelope for delays of 0-350 ms
+  const corr = new Float32Array(maxLag + 1);
+  for (let L = 0; L <= maxLag; L++){
+    let s = 0;
+    for (let k = 0; k + L < nb; k++) if (ce[k] > 0) s += ce[k] * md[k + L];
+    corr[L] = s;
+  }
+  let best = 0;
+  for (let L = 1; L <= maxLag; L++) if (corr[L] > corr[best]) best = L;
+  const sorted = Array.from(corr).sort((a, b) => a - b), median = sorted[maxLag >> 1] || 1e-12;
+  const confidence = corr[best] / (median + 1e-12);
+  return confidence >= 4 ? {delay: best / 1000, confidence} : null;
+}
+
+/* ---------- microphone: note checking ("Use microphone") and the ?record test tool share one input ----------
+   Each run is recorded with two channels: the microphone, and the app's own metronome clicks fed in
+   digitally. The clicks the microphone hears during the count-in tell us the speaker-to-mic delay. */
 const REC_MODE = /[?&]record\b/.test(location.search);
-let rec = null, lastTake = null, meterTimer = 0;
+const TF_URL = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js';
+const BP_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
+let mic = null, micOpening = null, micCheck = false, recTest = false, micRun = 0, lastTake = null, meterTimer = 0;
 const recStatus = t => { $('recStatus').textContent = t; };
 
-async function armRecorder(){
-  ensureAudio();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    $('recOn').checked = false;
-    recStatus('This browser can’t record here. Open the site at its https address in Chrome, Edge, or Safari.');
-    return;
-  }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1}});
-  } catch(e){
-    $('recOn').checked = false;
-    recStatus('Microphone access was blocked. Allow it in the browser’s site settings, then tick the box again.');
-    return;
-  }
-  const src = ac.createMediaStreamSource(stream);
-  const merger = ac.createChannelMerger(2);
-  const tap = ac.createGain();                     // the app's clicks, fed in digitally
-  const proc = ac.createScriptProcessor(4096, 2, 1);
-  const mute = ac.createGain(); mute.gain.value = 0;
-  const analyser = ac.createAnalyser(); analyser.fftSize = 1024;
-  src.connect(merger, 0, 0); tap.connect(merger, 0, 1);
-  merger.connect(proc); proc.connect(mute); mute.connect(ac.destination);
-  src.connect(analyser);
-  const track = stream.getAudioTracks()[0];
-  rec = {stream, src, merger, tap, proc, mute, analyser, collecting:false, chunks:[[],[]],
-         device: track.label || '', settings: track.getSettings ? track.getSettings() : {}};
-  proc.onaudioprocess = e => {
-    if (!rec || !rec.collecting) return;
-    rec.chunks[0].push(new Float32Array(e.inputBuffer.getChannelData(0)));
-    rec.chunks[1].push(new Float32Array(e.inputBuffer.getChannelData(1)));
-  };
-  const buf = new Float32Array(analyser.fftSize);
+function micErrorText(e){
+  if (e && e.message === 'unsupported') return 'This browser can’t use the microphone here. Open the site at its https address in Chrome, Edge, or Safari.';
+  if (e && e.name === 'NotFoundError') return 'No microphone was found. Plug one in or check your sound settings, then try again.';
+  return 'Microphone access was blocked. Allow it in your browser’s site settings, then try again.';
+}
+async function openMic(){
+  if (mic) return mic;
+  if (micOpening) return micOpening;
+  micOpening = (async () => {
+    ensureAudio();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('unsupported');
+    const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1}});
+    const src = ac.createMediaStreamSource(stream);
+    const merger = ac.createChannelMerger(2);
+    const tap = ac.createGain();                     // the app's clicks, fed in digitally
+    const proc = ac.createScriptProcessor(4096, 2, 1);
+    const mute = ac.createGain(); mute.gain.value = 0;
+    const analyser = ac.createAnalyser(); analyser.fftSize = 1024;
+    src.connect(merger, 0, 0); tap.connect(merger, 0, 1);
+    merger.connect(proc); proc.connect(mute); mute.connect(ac.destination);
+    src.connect(analyser);
+    const track = stream.getAudioTracks()[0];
+    const m = {stream, src, merger, tap, proc, mute, analyser, collecting:false, chunks:[[],[]],
+               device: track.label || '', settings: track.getSettings ? track.getSettings() : {}};
+    proc.onaudioprocess = e => {
+      if (!m.collecting) return;
+      m.chunks[0].push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      m.chunks[1].push(new Float32Array(e.inputBuffer.getChannelData(1)));
+    };
+    const buf = new Float32Array(analyser.fftSize);
+    clearInterval(meterTimer);
+    meterTimer = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v));
+      const w = Math.min(100, Math.round(Math.sqrt(peak) * 100)) + '%';
+      $('recLevel').style.width = w; $('micLevel').style.width = w;
+    }, 100);
+    mic = m;
+    return m;
+  })();
+  try { return await micOpening; } finally { micOpening = null; }
+}
+function closeMicIfUnused(){
+  if (!mic || micCheck || recTest || mic.collecting) return;
   clearInterval(meterTimer);
-  meterTimer = setInterval(() => {
-    if (!rec) return;
-    analyser.getFloatTimeDomainData(buf);
-    let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v));
-    $('recLevel').style.width = Math.min(100, Math.round(Math.sqrt(peak) * 100)) + '%';
-  }, 100);
-  recStatus('Microphone on' + (rec.device ? ' (' + rec.device + ')' : '') + '. Play a note to check the level, then press play.');
+  mic.stream.getTracks().forEach(t => t.stop());
+  try { mic.src.disconnect(); mic.proc.disconnect(); mic.mute.disconnect(); } catch(e){}
+  mic = null;
+  $('recLevel').style.width = '0'; $('micLevel').style.width = '0';
+}
+
+/* the note checker (TensorFlow.js + the Basic Pitch model) loads only when the microphone is turned on */
+let checkerP = null;
+function loadScript(src){
+  return new Promise((res, rej) => {
+    const el = document.createElement('script');
+    el.src = src; el.onload = res; el.onerror = () => rej(new Error('script'));
+    document.head.appendChild(el);
+  });
+}
+function loadChecker(){
+  if (!checkerP) checkerP = (async () => {
+    if (!window.tf) await loadScript(TF_URL);
+    await tf.ready();
+    await BasicPitch.load(BP_MODEL_URL);
+  })().catch(e => { checkerP = null; throw e; });
+  return checkerP;
+}
+
+function setMicStatus(text, kind){
+  $('micStatus').hidden = false;
+  $('micStatus').className = 'midistatus' + (kind === 'warn' ? ' warn' : '');
+  $('micMeter').hidden = kind !== 'ok';
+  $('micText').textContent = text;
+}
+async function toggleMicCheck(){
+  if (micCheck){
+    micCheck = false; micRun++;
+    closeMicIfUnused();
+    $('micBtn').textContent = 'Use microphone';
+    $('micStatus').hidden = true;
+    return;
+  }
+  $('micBtn').disabled = true;
+  setMicStatus('Starting the microphone…');
+  try { await openMic(); }
+  catch(e){ $('micBtn').disabled = false; setMicStatus(micErrorText(e), 'warn'); return; }
+  micCheck = true;
+  $('micBtn').textContent = 'Turn off microphone';
+  setMicStatus('Loading the note checker (first time only)…');
+  try { await loadChecker(); }
+  catch(e){
+    micCheck = false; closeMicIfUnused();
+    $('micBtn').textContent = 'Use microphone'; $('micBtn').disabled = false;
+    setMicStatus('The note checker couldn’t load. Check your internet connection, then try again.', 'warn');
+    return;
+  }
+  $('micBtn').disabled = state === 'playing';
+  setMicStatus('Microphone on' + (mic.device ? ' (' + mic.device + ')' : '') + '. Your playing is checked after each run; keep the metronome on your speakers.', 'ok');
+}
+
+async function armRecorder(){
+  recTest = true;
+  try { await openMic(); }
+  catch(e){ recTest = false; $('recOn').checked = false; recStatus(micErrorText(e)); return; }
+  recStatus('Microphone on' + (mic.device ? ' (' + mic.device + ')' : '') + '. Play a note to check the level, then press play.');
 }
 function disarmRecorder(){
-  clearInterval(meterTimer);
-  if (rec){
-    rec.stream.getTracks().forEach(t => t.stop());
-    try { rec.src.disconnect(); rec.proc.disconnect(); rec.mute.disconnect(); } catch(e){}
-  }
-  rec = null;
-  $('recLevel').style.width = '0';
+  recTest = false;
+  closeMicIfUnused();
   recStatus('Recording is off.');
 }
+
 function startTake(){
-  if (!rec) return;
-  session.connect(rec.tap);
-  rec.chunks = [[],[]];
-  rec.collecting = true;
-  lastTake = null;
-  $('recSave').hidden = true;
-  recStatus('Recording…');
+  if (!mic || !(micCheck || recTest)) return;
+  micRun++;
+  session.connect(mic.tap);
+  mic.chunks = [[],[]];
+  mic.collecting = true;
+  if (recTest){ lastTake = null; $('recSave').hidden = true; recStatus('Recording…'); }
 }
 function takeMeta(partial){
   const item = isLibrary() ? LIBRARY[+$('src').value] : null;
@@ -999,22 +1257,115 @@ function takeMeta(partial){
     midiPlayed: played.map(p => ({midi:p.midi, t:+p.t.toFixed(4)})),
     midiTimesAdjustedForOutputLatency: latency,
     outputLatency: ac.outputLatency || 0, baseLatency: ac.baseLatency || 0,
-    mic: {label: rec.device, settings: rec.settings},
+    mic: {label: mic.device, settings: mic.settings},
     userAgent: navigator.userAgent
   };
 }
+// Stop recording a moment after the run (to catch the last note), then save and/or check it.
+// Returns true when a microphone check is about to run.
 function endTake(partial){
-  if (!rec || !rec.collecting) return;
-  const r = rec, meta = takeMeta(partial), sr = ac.sampleRate;
-  setTimeout(() => {                               // keep a short tail after the last note
-    r.collecting = false;
-    lastTake = {chunks:r.chunks, meta, sr};
-    r.chunks = [[],[]];
-    const secs = lastTake.chunks[0].reduce((n,c) => n + c.length, 0) / sr;
-    $('recSave').hidden = false;
-    recStatus('Take ready (' + Math.round(secs) + ' s' + (partial ? ', stopped early' : '') + '). Set This take and any notes, then save it before your next run.');
+  if (!mic || !mic.collecting) return false;
+  const m = mic, run = micRun, sr = ac.sampleRate;
+  const snap = {ex, partial, upTo: partial ? heardT() : Infinity, viaMidi: played.length > 0,
+                spb, countInSec: countIn() * spb, meta: recTest ? takeMeta(partial) : null};
+  const willCheck = micCheck && !snap.viaMidi;
+  setTimeout(() => {
+    if (run !== micRun) return;                      // a new run has already started
+    m.collecting = false;
+    const chunks = m.chunks; m.chunks = [[],[]];
+    if (snap.meta){
+      lastTake = {chunks, meta:snap.meta, sr};
+      const secs = chunks[0].reduce((n,c) => n + c.length, 0) / sr;
+      $('recSave').hidden = false;
+      recStatus('Take ready (' + Math.round(secs) + ' s' + (partial ? ', stopped early' : '') + '). Set This take and any notes, then save it before your next run.');
+    }
+    if (willCheck) checkWithMic(chunks, sr, snap, run);
+    closeMicIfUnused();
   }, 700);
+  if (willCheck) showChecking(0);
+  return willCheck;
 }
+
+const concatF32 = parts => {
+  const out = new Float32Array(parts.reduce((n, a) => n + a.length, 0));
+  let o = 0; for (const a of parts){ out.set(a, o); o += a.length; }
+  return out;
+};
+async function resampleTo(x, sr, target){
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const oc = new OAC(1, Math.ceil(x.length * target / sr), target);
+  const buf = oc.createBuffer(1, x.length, sr);
+  buf.getChannelData(0).set(x);
+  const s = oc.createBufferSource(); s.buffer = buf; s.connect(oc.destination); s.start();
+  return (await oc.startRendering()).getChannelData(0);
+}
+// The app's own clicks are recorded alongside the microphone, so they can serve as a ruler:
+// if the browser ever drops a slice of audio, notes after it are put back where they belong.
+function clickRuler(clk, sr, spbSec){
+  const pos = []; let lastLoud = -1e9;               // a click starts after at least 50 ms of quiet
+  for (let i = 0; i < clk.length; i++)
+    if (Math.abs(clk[i]) > 0.05){ if (i - lastLoud > 0.05 * sr) pos.push(i); lastLoud = i; }
+  const pts = []; let k = 0;
+  pos.forEach((p, j) => { if (j) k += Math.max(1, Math.round((p - pos[j-1]) / sr / spbSec)); pts.push([p / sr, k * spbSec]); });
+  return r => {                                     // seconds into the recording -> seconds after the first click
+    if (!pts.length) return r;
+    let i = 0; while (i < pts.length - 1 && pts[i+1][0] <= r) i++;
+    return pts[i][1] + (r - pts[i][0]);
+  };
+}
+const storedDelay = () => { try { const v = parseFloat(localStorage.getItem('readAhead.micDelay')); return isFinite(v) ? v : null; } catch(e){ return null; } };
+const saveDelay = v => { try { localStorage.setItem('readAhead.micDelay', String(v)); } catch(e){} };
+
+function showChecking(p){
+  const r = $('results');
+  let bar = r.querySelector('.pbar span');
+  if (!bar){
+    r.innerHTML = '<div class="checking">Checking your playing… <span class="pbar"><span></span></span></div>';
+    bar = r.querySelector('.pbar span');
+  }
+  r.hidden = false;
+  bar.style.width = Math.round(p * 100) + '%';
+}
+function revealResults(){
+  const r = $('results');
+  if (r.hidden) return;
+  const edge = window.innerHeight - document.querySelector('.transport').offsetHeight - 12;
+  const b = r.getBoundingClientRect().bottom;
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (b > edge) window.scrollBy({top: b - edge, behavior: reduce ? 'auto' : 'smooth'});
+}
+
+async function checkWithMic(chunks, sr, snap, run){
+  const alive = () => run === micRun && ex === snap.ex;
+  showChecking(0);
+  try {
+    await loadChecker();
+    const micData = concatF32(chunks[0]), clk = concatF32(chunks[1]);
+    let c0 = 0;                                       // the first count-in click, in the recording
+    while (c0 < clk.length && Math.abs(clk[c0]) <= 0.05) c0++;
+    if (c0 >= clk.length) throw new Error('no clicks');
+    const found = measureMicDelay(micData, clk, sr, c0, snap.countInSec);
+    let delay;
+    if (found){ delay = found.delay; saveDelay(delay); }
+    else { const st = storedDelay(); delay = st !== null ? st : (ac.outputLatency || 0) + (ac.baseLatency || 0) + 0.02; }
+    const audio = await resampleTo(micData, sr, BasicPitch.SR);
+    const notes = await BasicPitch.transcribe(audio, p => { if (!alive()) throw new Error('cancelled'); showChecking(p); });
+    if (!alive()) return;
+    const ruler = clickRuler(clk, sr, snap.spb);
+    const heard = notes.map(n => ({midi:n.midi, t:ruler(n.start) - delay}));
+    const scored = scoreRun(snap.upTo, !snap.partial, heard, !found);
+    if (scored && !snap.partial && state === 'done'){ covered = []; peek = []; render(); }
+    if (state === 'done') readout('Done', scored ? 'Your results are below the score.' : 'Click bars to check yourself, or reveal all');
+    if (scored && !snap.partial) revealResults();
+  } catch(e){
+    if (e.message === 'cancelled' || !alive()) return;
+    console.error('Microphone check failed:', e);
+    $('results').hidden = false;
+    $('results').textContent = 'The microphone check didn’t work this time. Try the run again; if it keeps happening, turn the microphone off and on.';
+    if (state === 'done') readout('Done', 'Click bars to check yourself, or reveal all');
+  }
+}
+
 function encodeWav(chunks, sr, meta){
   const n = chunks[0].reduce((k,c) => k + c.length, 0);
   const json = new TextEncoder().encode(JSON.stringify(meta));
@@ -1115,6 +1466,7 @@ $('transpose').addEventListener('change', applyTranspose);
 $('tempo').addEventListener('input', tempoLabel);
 $('listen').addEventListener('click', listen);
 $('midiBtn').addEventListener('click', connectMidi);
+$('micBtn').addEventListener('click', toggleMicCheck);
 $('startBar').addEventListener('change', () => { syncCovers(); readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(startBar()+1)+'.'); });
 
 document.addEventListener('keydown', e => {
