@@ -31,6 +31,7 @@
   --led:#F2B72B; --led-off:#3A4B52; --btn:#E4ECEB; --btn-text:#141B20; --peek:#8FB3E8;
 }
 *,*::before,*::after{box-sizing:inherit}
+[hidden]{display:none !important}
 html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
 body{
   margin:0;min-height:100%;background:var(--bg);color:var(--text);
@@ -95,6 +96,14 @@ button:disabled{opacity:.45;cursor:default}
 .bar .badge.good{background:#2F7D4F}
 .bar .badge.bad{background:#B23A31}
 .hint{color:var(--muted);font-size:.9rem;margin-top:14px;max-width:70ch}
+.rectest{display:none;margin:0 0 18px;padding:12px 16px 14px;border:2px dashed var(--line);border-radius:8px;background:var(--surface)}
+.rectest.show{display:flex;flex-wrap:wrap;gap:12px 22px;align-items:flex-end}
+.rectest h2{font-size:1rem;line-height:1.2;margin:0;width:100%}
+.rectest input[type=text]{font:inherit;color:var(--text);padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--paper);width:min(320px,80vw)}
+.meterwrap{display:flex;align-items:center;gap:8px;font-size:.9rem;color:var(--muted);padding-bottom:9px}
+.meter{width:120px;height:8px;border-radius:4px;background:var(--led-off);overflow:hidden}
+.meter span{display:block;height:100%;width:0;background:#3E9B62;transition:width 80ms}
+.recstatus{font-size:.9rem;color:var(--text);padding-bottom:7px;max-width:52ch}
 kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--surface)}
 
 .transport{
@@ -168,6 +177,20 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
       <span class="midistatus" id="midiStatus" hidden><span class="mdot" id="mdot"></span><span id="midiText"></span></span>
       <label class="field check" id="midiSoundWrap" hidden><input id="midiSound" type="checkbox"> Sound from the app</label>
     </div>
+  </div>
+
+  <div class="rectest" id="rectest">
+    <h2>Recording test</h2>
+    <label class="field check"><input id="recOn" type="checkbox"> Record each run</label>
+    <span class="meterwrap">Mic <span class="meter"><span id="recLevel"></span></span></span>
+    <label class="field">This take
+      <select id="recTake"><option value="clean">Clean</option><option value="mistakes">With mistakes</option></select>
+    </label>
+    <label class="field">Notes on this take
+      <input id="recNotes" type="text" placeholder="e.g. wrong note in bar 3, skipped bar 6">
+    </label>
+    <span class="recstatus" id="recStatus">Tick Record each run and allow the microphone, then press play.</span>
+    <button id="recSave" hidden>Save recording</button>
   </div>
 
   <p class="caption" id="caption"></p>
@@ -566,7 +589,7 @@ function updateButtons(){
   $('play').innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   $('listen').textContent = state==='listening' ? 'Stop listening' : 'Listen';
   $('play').setAttribute('aria-label', playing ? 'Pause' : state==='paused' ? 'Resume' : 'Play');
-  ['src','bars','clef','key','level','tempo','startBar','transpose'].forEach(id => $(id).disabled = playing);
+  ['src','bars','clef','key','level','tempo','startBar','transpose','recOn'].forEach(id => $(id).disabled = playing);
 }
 
 const countIn = () => ex.meter.pulses >= 3 ? ex.meter.pulses : ex.meter.pulses*2;
@@ -597,6 +620,7 @@ function play(){
   played = [];
   clearResults();
   state = 'playing';
+  startTake();
   render(); updateButtons();
   raf = requestAnimationFrame(tick);
 }
@@ -701,6 +725,7 @@ function pause(){
   state = 'paused';
   $('startBar').value = String(pausedMeasure);
   scoreRun(heardT(), false);
+  endTake(true);
   updateButtons(); syncCovers();
   readout('Paused', 'Click a covered bar to peek. Play resumes at bar '+(pausedMeasure+1)+', or click any uncovered bar to start there.');
 }
@@ -710,6 +735,7 @@ function finish(){
   state = 'done';
   $('startBar').value = '0';
   const scored = scoreRun(Infinity, true);
+  endTake(false);
   if (scored){ covered = []; peek = []; render(); }
   updateButtons(); syncCovers();
   readout('Done', scored ? 'Your results are below the score.' : 'Click bars to check yourself, or reveal all');
@@ -888,6 +914,146 @@ function release(n){
   delete sounding[n];
 }
 
+/* ---------- recording test: shown only when the address ends in ?record ----------
+   Saves a stereo WAV per run: channel 1 = microphone, channel 2 = the app's own metronome
+   clicks (a sample-accurate timing reference), plus a JSON chunk "rdah" describing the run. */
+const REC_MODE = /[?&]record\b/.test(location.search);
+let rec = null, lastTake = null, meterTimer = 0;
+const recStatus = t => { $('recStatus').textContent = t; };
+
+async function armRecorder(){
+  ensureAudio();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    $('recOn').checked = false;
+    recStatus('This browser can’t record here. Open the site at its https address in Chrome, Edge, or Safari.');
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1}});
+  } catch(e){
+    $('recOn').checked = false;
+    recStatus('Microphone access was blocked. Allow it in the browser’s site settings, then tick the box again.');
+    return;
+  }
+  const src = ac.createMediaStreamSource(stream);
+  const merger = ac.createChannelMerger(2);
+  const tap = ac.createGain();                     // the app's clicks, fed in digitally
+  const proc = ac.createScriptProcessor(4096, 2, 1);
+  const mute = ac.createGain(); mute.gain.value = 0;
+  const analyser = ac.createAnalyser(); analyser.fftSize = 1024;
+  src.connect(merger, 0, 0); tap.connect(merger, 0, 1);
+  merger.connect(proc); proc.connect(mute); mute.connect(ac.destination);
+  src.connect(analyser);
+  const track = stream.getAudioTracks()[0];
+  rec = {stream, src, merger, tap, proc, mute, analyser, collecting:false, chunks:[[],[]],
+         device: track.label || '', settings: track.getSettings ? track.getSettings() : {}};
+  proc.onaudioprocess = e => {
+    if (!rec || !rec.collecting) return;
+    rec.chunks[0].push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    rec.chunks[1].push(new Float32Array(e.inputBuffer.getChannelData(1)));
+  };
+  const buf = new Float32Array(analyser.fftSize);
+  clearInterval(meterTimer);
+  meterTimer = setInterval(() => {
+    if (!rec) return;
+    analyser.getFloatTimeDomainData(buf);
+    let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v));
+    $('recLevel').style.width = Math.min(100, Math.round(Math.sqrt(peak) * 100)) + '%';
+  }, 100);
+  recStatus('Microphone on' + (rec.device ? ' (' + rec.device + ')' : '') + '. Play a note to check the level, then press play.');
+}
+function disarmRecorder(){
+  clearInterval(meterTimer);
+  if (rec){
+    rec.stream.getTracks().forEach(t => t.stop());
+    try { rec.src.disconnect(); rec.proc.disconnect(); rec.mute.disconnect(); } catch(e){}
+  }
+  rec = null;
+  $('recLevel').style.width = '0';
+  recStatus('Recording is off.');
+}
+function startTake(){
+  if (!rec) return;
+  session.connect(rec.tap);
+  rec.chunks = [[],[]];
+  rec.collecting = true;
+  lastTake = null;
+  $('recSave').hidden = true;
+  recStatus('Recording…');
+}
+function takeMeta(partial){
+  const item = isLibrary() ? LIBRARY[+$('src').value] : null;
+  return {
+    app:'Read Ahead recording test', format:1, recordedAt:new Date().toISOString(), partial,
+    exercise: item ? {set:item.set || 'Schäfer (Classical)', no:item.no, title:ex.title, key:item.key, time:item.time,
+                      rh:item.rh, lh:item.lh || null, rh2:item.rh2 || null, lh2:item.lh2 || null}
+                   : {set:'Random (generated)', title:'Random (generated)'},
+    shownKey: ex.key, transposedBy: ex.transposed || 0,
+    tempo: +$('tempo').value, secondsPerClick: spb, clicksPerBar: ex.meter.pulses, quartersPerClick: ex.meter.pulseQ,
+    timeSignature: ex.meter.sig, countInClicks: countIn(), startBar: startMeasure + 1,
+    metronomeDuringRun: $('clickOn').checked,
+    sampleRate: ac.sampleRate, channels: ['microphone', 'app metronome clicks (digital)'],
+    timesAreSecondsAfter: 'the first count-in click (the first click on channel 2)',
+    expectedNotes: expected.map(e => ({midi:e.midi, t:+e.t.toFixed(4), bar:e.bar + 1})),
+    midiPlayed: played.map(p => ({midi:p.midi, t:+p.t.toFixed(4)})),
+    midiTimesAdjustedForOutputLatency: latency,
+    outputLatency: ac.outputLatency || 0, baseLatency: ac.baseLatency || 0,
+    mic: {label: rec.device, settings: rec.settings},
+    userAgent: navigator.userAgent
+  };
+}
+function endTake(partial){
+  if (!rec || !rec.collecting) return;
+  const r = rec, meta = takeMeta(partial), sr = ac.sampleRate;
+  setTimeout(() => {                               // keep a short tail after the last note
+    r.collecting = false;
+    lastTake = {chunks:r.chunks, meta, sr};
+    r.chunks = [[],[]];
+    const secs = lastTake.chunks[0].reduce((n,c) => n + c.length, 0) / sr;
+    $('recSave').hidden = false;
+    recStatus('Take ready (' + Math.round(secs) + ' s' + (partial ? ', stopped early' : '') + '). Set This take and any notes, then save it before your next run.');
+  }, 700);
+}
+function encodeWav(chunks, sr, meta){
+  const n = chunks[0].reduce((k,c) => k + c.length, 0);
+  const json = new TextEncoder().encode(JSON.stringify(meta));
+  const metaLen = json.length + (json.length % 2);
+  const dataLen = n * 4;                           // 2 channels x 16-bit
+  const buf = new ArrayBuffer(12 + 24 + 8 + dataLen + 8 + metaLen);
+  const v = new DataView(buf); let o = 0;
+  const str = s => { for (const ch of s) v.setUint8(o++, ch.charCodeAt(0)); };
+  str('RIFF'); v.setUint32(o, buf.byteLength - 8, true); o += 4; str('WAVE');
+  str('fmt '); v.setUint32(o, 16, true); o += 4; v.setUint16(o, 1, true); o += 2; v.setUint16(o, 2, true); o += 2;
+  v.setUint32(o, sr, true); o += 4; v.setUint32(o, sr * 4, true); o += 4; v.setUint16(o, 4, true); o += 2; v.setUint16(o, 16, true); o += 2;
+  str('data'); v.setUint32(o, dataLen, true); o += 4;
+  for (let c = 0; c < chunks[0].length; c++){
+    const a = chunks[0][c], b = chunks[1][c];
+    for (let i = 0; i < a.length; i++){
+      v.setInt16(o, Math.max(-1, Math.min(1, a[i])) * 32767, true); o += 2;
+      v.setInt16(o, Math.max(-1, Math.min(1, b[i])) * 32767, true); o += 2;
+    }
+  }
+  str('rdah'); v.setUint32(o, json.length, true); o += 4;
+  new Uint8Array(buf, o, json.length).set(json);
+  return new Blob([buf], {type:'audio/wav'});
+}
+function saveTake(){
+  if (!lastTake) return;
+  const meta = Object.assign({}, lastTake.meta, {take: $('recTake').value, notes: $('recNotes').value.trim()});
+  const blob = encodeWav(lastTake.chunks, lastTake.sr, meta);
+  const set = (meta.exercise.set || 'random').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().split(/[^a-z]+/)[0];
+  const d = new Date(), pad = x => String(x).padStart(2, '0');
+  const name = 'readahead-' + set + (meta.exercise.no ? '-no' + meta.exercise.no : '') + '-' + meta.take + '-' + meta.tempo + 'bpm-' +
+               pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.wav';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 20000);
+  recStatus('Saved as ' + name + '.');
+  $('recNotes').value = '';
+}
+
 function isLibrary(){ return $('src').value !== 'random'; }
 function syncSourceUI(){
   const lib = isLibrary();
@@ -952,6 +1118,7 @@ $('midiBtn').addEventListener('click', connectMidi);
 $('startBar').addEventListener('change', () => { syncCovers(); readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(startBar()+1)+'.'); });
 
 document.addEventListener('keydown', e => {
+  if (e.target.matches('input[type=text],textarea')) return;
   if (e.target.matches('input,select,textarea') && e.key!==' ') return;
   if (e.target.matches('select')) return;
   if (e.key===' ' && e.target.matches('button')) return;
@@ -987,6 +1154,9 @@ async function loadLibrary(){
   });
   if (!LIBRARY.length) readout('Ready', 'Exercise file not found, so only random exercises are available.');
 }
+if (REC_MODE) $('rectest').classList.add('show');
+$('recOn').addEventListener('change', e => { e.target.checked ? armRecorder() : disarmRecorder(); });
+$('recSave').addEventListener('click', saveTake);
 updateButtons();
 syncSourceUI();
 loadExercise();
