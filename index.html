@@ -81,6 +81,19 @@ button:disabled{opacity:.45;cursor:default}
 
 .caption{margin:0 0 8px;font-weight:700}
 .credit{color:var(--muted);font-size:.85rem;margin-top:10px}
+.midi{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.midistatus{display:flex;align-items:center;gap:8px;font-size:.9rem;color:var(--muted);max-width:42ch}
+.midistatus.warn{color:var(--text)}
+.mdot{width:10px;height:10px;border-radius:50%;background:var(--led-off);flex:none}
+.mdot.ok{background:#3E9B62}
+.mdot.hit{background:var(--led);box-shadow:0 0 8px var(--led)}
+.results{margin-top:14px;padding:12px 16px;border-radius:8px;background:var(--surface);border:1px solid var(--line);max-width:70ch}
+.results strong{font-size:1.15rem}
+.results .legend{display:flex;gap:16px;margin-top:6px;font-size:.88rem;color:var(--muted)}
+.results .sw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:baseline}
+.bar .badge{position:absolute;right:4px;top:4px;font-size:.72rem;font-weight:700;line-height:1;padding:3px 6px;border-radius:10px;color:#fff;pointer-events:none;z-index:2}
+.bar .badge.good{background:#2F7D4F}
+.bar .badge.bad{background:#B23A31}
 .hint{color:var(--muted);font-size:.9rem;margin-top:14px;max-width:70ch}
 kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--surface)}
 
@@ -150,13 +163,19 @@ kbd{font-family:inherit;font-size:.82rem;border:1px solid var(--line);border-bot
       <select id="transpose"></select>
     </label>
     <button id="newBtn">New exercise</button>
+    <div class="midi">
+      <button id="midiBtn">Connect MIDI keyboard</button>
+      <span class="midistatus" id="midiStatus" hidden><span class="mdot" id="mdot"></span><span id="midiText"></span></span>
+      <label class="field check" id="midiSoundWrap" hidden><input id="midiSound" type="checkbox"> Sound from the app</label>
+    </div>
   </div>
 
   <p class="caption" id="caption"></p>
   <div class="paper">
     <div id="score"><div id="svgHost"></div><div id="overlay"></div></div>
   </div>
-  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise.</p>
+  <div class="results" id="results" aria-live="polite" hidden></div>
+  <p class="hint">While paused, click a covered bar to peek at it; click again to cover it. Resuming counts you in at the bar you paused in. To start somewhere else, click any uncovered bar or use Start at bar. Shortcuts: <kbd>Space</kbd> play/pause, <kbd>R</kbd> restart, <kbd>N</kbd> new exercise. With a MIDI keyboard connected, your notes are checked as you play: at the end, green notes were right and red ones were missed or wrong.</p>
   <p class="credit">Copyright © 2026 Alexander Zhu</p>
 </div>
 
@@ -321,6 +340,10 @@ function generate(opts){
 
 /* ---------- state ---------- */
 let ex = null, baseEx = null;
+/* MIDI */
+const COL_HIT = '#2F7D4F', COL_MISS = '#B23A31';
+let midiAccess = null, midiInputs = 0, played = [], expected = [], perfAtT0 = 0, latency = 0, runOff = 0, tolSec = 0.25;
+let marks = new Map(), barStats = [];
 let covered = [], peek = [];
 let state = 'idle';              // idle | playing | paused | done
 let startMeasure = 0, currentMeasure = -1, pausedMeasure = 0;
@@ -394,6 +417,8 @@ function makeNotes(meas, clef, dir){
     const sn = new VF.StaveNote(o);
     if (nt.d.length > 1 && nt.d.endsWith('d')) VF.Dot.buildAndAttach([sn], {all:true});
     (nt.accs||[]).forEach((acc,k) => { if (acc) sn.addModifier(new VF.Accidental(acc), k); });
+    const mk = marks.get(nt);
+    if (mk) mk.forEach((m,k) => { if (m){ const c = m==='hit' ? COL_HIT : COL_MISS; sn.setKeyStyle(k, {fillStyle:c, strokeStyle:c}); } });
     return sn;
   });
 }
@@ -462,7 +487,7 @@ function render(){
       el.className = 'bar';
       el.style.left = x0+'px'; el.style.top = yTop+'px';
       el.style.width = (x + w - 3 - x0)+'px'; el.style.height = (yBot-yTop)+'px';
-      el.innerHTML = '<div class="cover"></div><span class="num">'+(i+1)+'</span>';
+      el.innerHTML = '<div class="cover"></div><span class="num">'+(i+1)+'</span>' + badgeHtml(i);
       el.dataset.i = i;
       el.addEventListener('click', () => onBarClick(i));
       overlay.appendChild(el);
@@ -563,8 +588,16 @@ function play(){
     else if (metro) click(t, (b-CI)%P===0 ? 'down' : 'beat');
   }
   currentMeasure = -1;
+  // keyboard checking: line the keyboard clock up with what the student hears
+  latency = ac.outputLatency || ac.baseLatency || 0;
+  perfAtT0 = performance.now() + (t0 - ac.currentTime) * 1000;
+  runOff = CI * spb;
+  tolSec = Math.min(0.35, Math.max(0.15, 0.3 * spb));
+  expected = expectedNotes();
+  played = [];
+  clearResults();
   state = 'playing';
-  updateButtons(); syncCovers();
+  render(); updateButtons();
   raf = requestAnimationFrame(tick);
 }
 
@@ -582,7 +615,11 @@ function tick(){
     const P = ex.meter.pulses;
     const pb = b - countIn();
     const m = startMeasure + Math.floor(pb/P);
-    if (m >= n){ finish(); return; }
+    if (m >= n){
+      // give a late final note a moment to arrive before scoring
+      if (heardT() < runEnd() + tolSec){ setLeds(-1); raf = requestAnimationFrame(tick); return; }
+      finish(); return;
+    }
     if (m !== currentMeasure){
       currentMeasure = m;
       for (let k=startMeasure;k<=m;k++) covered[k] = true;
@@ -663,6 +700,7 @@ function pause(){
   pausedMeasure = currentMeasure >= 0 ? currentMeasure : startMeasure;
   state = 'paused';
   $('startBar').value = String(pausedMeasure);
+  scoreRun(heardT(), false);
   updateButtons(); syncCovers();
   readout('Paused', 'Click a covered bar to peek. Play resumes at bar '+(pausedMeasure+1)+', or click any uncovered bar to start there.');
 }
@@ -671,8 +709,10 @@ function finish(){
   stopAudio();
   state = 'done';
   $('startBar').value = '0';
+  const scored = scoreRun(Infinity, true);
+  if (scored){ covered = []; peek = []; render(); }
   updateButtons(); syncCovers();
-  readout('Done', 'Click bars to check yourself, or reveal all');
+  readout('Done', scored ? 'Your results are below the score.' : 'Click bars to check yourself, or reveal all');
 }
 
 function restart(){
@@ -680,8 +720,172 @@ function restart(){
   stopAudio();
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
   $('startBar').value = '0';
+  if (clearResults()) render();
   updateButtons(); syncCovers();
   readout('Ready', 'Take a look, then press play');
+}
+
+/* ---------- MIDI keyboard: input, checking, results ---------- */
+const heardT = () => (ac.currentTime - t0) - latency;          // seconds since t0, as heard
+const barSec = () => (ex.meter.num * 4 / ex.meter.val) * (spb / ex.meter.pulseQ);
+const runEnd = () => runOff + (nBars() - startMeasure) * barSec();
+
+function expectedNotes(){
+  const qSec = spb / ex.meter.pulseQ, barQ = ex.meter.num * 4 / ex.meter.val, out = [];
+  ex.staves.forEach(sd => sd.voices.forEach(vm => {
+    let open = {};
+    vm.forEach((meas, bi) => {
+      let q = bi * barQ;
+      meas.forEach(nt => {
+        const dq = durQ(nt.d);
+        if (nt.rest || nt.ghost){ open = {}; q += dq; return; }
+        const next = {};
+        nt.keys.forEach((k, ki) => {
+          const prev = open[k];
+          const held = prev && prev.tie && prev.counted;          // tied on from a note already checked
+          if (!held && bi >= startMeasure)
+            out.push({nt, ki, bar:bi, midi:midiOf(k), t: runOff + (q - startMeasure*barQ) * qSec});
+          next[k] = {tie:nt.tie, counted: held || bi >= startMeasure};
+        });
+        open = next; q += dq;
+      });
+    });
+  }));
+  return out.sort((a,b) => a.t - b.t);
+}
+
+function clearResults(){
+  const had = marks.size > 0 || barStats.length > 0;
+  marks = new Map(); barStats = [];
+  $('results').hidden = true; $('results').innerHTML = '';
+  return had;
+}
+
+function badgeHtml(i){
+  const b = barStats[i];
+  if (!b) return '';
+  const probs = [];
+  if (b.miss) probs.push(b.miss + ' missed');
+  if (b.extra) probs.push(b.extra + ' extra');
+  return probs.length ? '<span class="badge bad">'+probs.join(', ')+'</span>' : '<span class="badge good">✓</span>';
+}
+
+// Match what was played against what was written. upTo = how far into the run to judge (seconds).
+function scoreRun(upTo, final){
+  if (!midiInputs) return false;
+  const due = expected.filter(e => e.t <= upTo);
+  if (!due.length) return false;
+  if (!played.length){
+    $('results').hidden = false;
+    $('results').innerHTML = 'No notes came in from your keyboard during that run. Check that it’s connected, then try again.';
+    return false;
+  }
+  const used = new Array(played.length).fill(false);
+  let hits = 0, sumDt = 0;
+  marks = new Map(); barStats = [];
+  const stat = i => barStats[i] || (barStats[i] = {miss:0, extra:0});
+  due.forEach(e => {
+    let best = -1, bestDt = Infinity;
+    played.forEach((p, j) => {
+      if (used[j] || p.midi !== e.midi) return;
+      const dt = p.t - e.t;
+      if (Math.abs(dt) <= tolSec && Math.abs(dt) < Math.abs(bestDt)){ best = j; bestDt = dt; }
+    });
+    const arr = marks.get(e.nt) || []; marks.set(e.nt, arr);
+    stat(e.bar);
+    if (best >= 0){ used[best] = true; hits++; sumDt += bestDt; arr[e.ki] = 'hit'; }
+    else { arr[e.ki] = 'miss'; stat(e.bar).miss++; }
+  });
+  // keys pressed that matched nothing (ignore the count-in)
+  let extras = 0;
+  played.forEach((p, j) => {
+    if (used[j] || p.t < runOff - tolSec || p.t > Math.min(upTo, runEnd()) + tolSec) return;
+    extras++;
+    const bar = Math.min(nBars()-1, Math.max(startMeasure, startMeasure + Math.floor((p.t - runOff) / barSec())));
+    stat(bar).extra++;
+  });
+  const missed = due.length - hits;
+  const avg = hits ? Math.round(sumDt / hits * 1000) : 0;
+  const timing = !hits ? '' : Math.abs(avg) < 25 ? 'Your timing was right on the beat.'
+    : 'On average you played '+Math.abs(avg)+' ms '+(avg > 0 ? 'late' : 'early')+'.';
+  $('results').hidden = false;
+  $('results').innerHTML =
+    '<strong>'+hits+' of '+due.length+' notes right</strong>' + (final ? '' : ' so far') + '. ' +
+    (missed ? missed+' missed or wrong. ' : '') + (extras ? extras+' extra '+(extras===1?'key':'keys')+'. ' : '') + timing +
+    '<div class="legend"><span><span class="sw" style="background:'+COL_HIT+'"></span>Right note, on time</span>' +
+    '<span><span class="sw" style="background:'+COL_MISS+'"></span>Missed, wrong, or off the beat</span></div>';
+  if (!final) render();
+  return true;
+}
+
+function setMidiStatus(text, kind){
+  $('midiStatus').hidden = false;
+  $('midiStatus').className = 'midistatus' + (kind==='warn' ? ' warn' : '');
+  $('mdot').className = 'mdot' + (kind==='ok' ? ' ok' : '');
+  $('midiText').textContent = text;
+}
+async function connectMidi(){
+  if (!navigator.requestMIDIAccess){
+    setMidiStatus('This browser can’t use MIDI keyboards. Use Chrome or Edge on a computer, or Chrome on Android.', 'warn');
+    return;
+  }
+  ensureAudio();
+  try { midiAccess = await navigator.requestMIDIAccess(); }
+  catch(e){
+    setMidiStatus('Keyboard access was blocked. Allow MIDI devices for this site in your browser’s settings, then try again.', 'warn');
+    return;
+  }
+  midiAccess.onstatechange = refreshInputs;
+  refreshInputs();
+}
+function refreshInputs(){
+  const ins = [...midiAccess.inputs.values()].filter(i => i.state !== 'disconnected');
+  ins.forEach(i => { i.onmidimessage = onMidi; });
+  midiInputs = ins.length;
+  $('midiBtn').hidden = ins.length > 0;
+  $('midiSoundWrap').hidden = ins.length === 0;
+  if (ins.length) setMidiStatus('Connected: ' + ins.map(i => i.name).join(', '), 'ok');
+  else { $('midiBtn').hidden = false; setMidiStatus('No keyboard found. Plug one in and it will connect automatically.', 'warn'); }
+}
+let dotTimer = 0;
+function onMidi(e){
+  const [st, d1, d2] = e.data, cmd = st & 0xF0;
+  if (cmd === 0x90 && d2 > 0){
+    $('mdot').className = 'mdot hit';
+    clearTimeout(dotTimer); dotTimer = setTimeout(() => { $('mdot').className = 'mdot ok'; }, 120);
+    if ($('midiSound').checked) keyOn(d1, d2);
+    if (state === 'playing'){
+      const when = e.timeStamp > 0 ? e.timeStamp : performance.now();
+      played.push({midi:d1, t:(when - perfAtT0) / 1000 - latency});
+    }
+  } else if (cmd === 0x80 || (cmd === 0x90 && d2 === 0)){
+    keyOff(d1);
+  } else if (cmd === 0xB0 && d1 === 64){
+    sustain = d2 >= 64;
+    if (!sustain) Object.keys(sounding).forEach(n => { if (sounding[n].up) release(+n); });
+  }
+}
+/* simple built-in sound for keyboards without speakers */
+const sounding = {}; let sustain = false;
+function keyOn(n, vel){
+  ensureAudio();
+  if (sounding[n]) release(n);
+  const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+  o.type = 'triangle'; o.frequency.value = 440 * Math.pow(2, (n-69)/12);
+  const peak = 0.06 + 0.22 * vel / 127;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(peak * 0.25, t + 1.2);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 6);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t + 6.1);
+  sounding[n] = {o, g, up:false};
+}
+function keyOff(n){ if (!sounding[n]) return; if (sustain) sounding[n].up = true; else release(n); }
+function release(n){
+  const s = sounding[n]; if (!s) return;
+  const t = ac.currentTime;
+  try { s.g.gain.cancelScheduledValues(t); s.g.gain.setTargetAtTime(0.0001, t, 0.05); s.o.stop(t + 0.4); } catch(e){}
+  delete sounding[n];
 }
 
 function isLibrary(){ return $('src').value !== 'random'; }
@@ -699,6 +903,7 @@ function loadExercise(){
   $('caption').textContent = ex.title;
   $('caption').hidden = !ex.title;
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
+  clearResults();
   buildLeds(); tempoLabel();
   fillStartBars();
   render(); updateButtons();
@@ -713,6 +918,7 @@ function applyTranspose(){
   stopAudio();
   ex = transposeEx(baseEx, +$('transpose').value);
   state = 'idle'; covered = []; peek = []; currentMeasure = -1;
+  clearResults();
   render(); updateButtons();
   readout('Ready', keyLabel()+'. Take a look, then press play.');
 }
@@ -742,6 +948,7 @@ $('src').addEventListener('change', () => { syncSourceUI(); $('transpose').value
 $('transpose').addEventListener('change', applyTranspose);
 $('tempo').addEventListener('input', tempoLabel);
 $('listen').addEventListener('click', listen);
+$('midiBtn').addEventListener('click', connectMidi);
 $('startBar').addEventListener('change', () => { syncCovers(); readout(state==='paused' ? 'Paused' : 'Ready', 'Play will start at bar '+(startBar()+1)+'.'); });
 
 document.addEventListener('keydown', e => {
